@@ -2,69 +2,145 @@ import ssl
 import socket
 import os
 import requests
+import json
+import logging
 from dotenv import load_dotenv
 from datetime import datetime, timezone
-import logging
+
+STATE_FILE = "ssl_state.json"
+LOG_FILE = "ssl_monitor.log"
+EXPIRY_THRESHOLD_DAYS = 5
+
 
 load_dotenv()
-
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
-DOMAINS = [d.strip() for d in os.getenv('DOMAINS', '').split(',')]
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+DOMAINS = [d.strip() for d in os.getenv("DOMAINS", "").split(",") if d.strip()]
 
 
 logging.basicConfig(
-    filename="ssl_monitor.log",
+    filename=LOG_FILE,
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
+# Утилиты для состояния уведомлений
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Не удалось загрузить state: {e}")
+    return {}
 
-# Получаем дату истечения SSL-сертификата для домена
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Не удалось сохранить state: {e}")
+
+# Проверка валидности токена
+def validate_bot():
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN не задан в .env")
+        return False
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10)
+        if not r.ok:
+            logging.error(f"Telegram getMe вернул ошибку: {r.status_code} {r.text}")
+            return False
+        data = r.json()
+        if not data.get("ok"):
+            logging.error(f"Telegram getMe ok=false: {data}")
+            return False
+        logging.info("Telegram token успешно проверен.")
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при проверке токена Telegram: {e}")
+        return False
+
+# Получаем дату истечения сертификата
 def get_certificate_expiry(domain):
     try:
         context = ssl.create_default_context()
-        with socket.create_connection((domain, 443), timeout=5) as sock:
+        with socket.create_connection((domain, 443), timeout=15) as sock:
             with context.wrap_socket(sock, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
-                expiry_date = datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
-                return expiry_date.replace(tzinfo=timezone.utc)
+                expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                return expiry.replace(tzinfo=timezone.utc)
     except Exception as e:
         logging.error(f"Ошибка при получении сертификата {domain}: {e}")
         return None
 
-
-# Отправляем сообщение в Telegram
-def send_telegram_message(message):
+# отправка Telegram-сообщения (с проверкой)
+def send_telegram_message(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        logging.error("BOT_TOKEN или CHAT_ID не заданы. Пропускаем отправку.")
+        return False
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": message}
-        requests.post(url, data=data, timeout=5)
+        payload = {"chat_id": CHAT_ID, "text": text}
+        r = requests.post(url, data=payload, timeout=8)
+        if not r.ok:
+            logging.error(f"Ошибка при отправке в Telegram: {r.status_code} {r.text}")
+            return False
+        resp = r.json()
+        if not resp.get("ok"):
+            logging.error(f"Telegram API вернул ok=false: {resp}")
+            return False
+        return True
     except Exception as e:
-        logging.error(f"Ошибка при отправке Telegram-сообщения: {e}")
+        logging.error(f"Исключение при отправке в Telegram: {e}")
+        return False
 
-
-# Проверяем все домены и уведомляем, если сертификат истекает от 5 дней
+# проверка доменов
 def check_domains(test_mode=False):
+    # если токен невалиден то не отправляем, но логируем
+    bot_ok = validate_bot()
+    state = load_state()
+
     for domain in DOMAINS:
-        expiry_date = get_certificate_expiry(domain)
-        if not expiry_date:
+        expiry = get_certificate_expiry(domain)
+        if not expiry:
+            print(f"{domain}: не удалось получить сертификат (подробности в логе)")
             continue
 
-        days_left = (expiry_date - datetime.now(timezone.utc)).days
-        expiry_str = expiry_date.strftime('%d.%m.%Y %H:%M:%S')
-
-        log_msg = f"{domain}: истекает {expiry_str}, осталось {days_left} дней"
+        days_left = (expiry - datetime.now(timezone.utc)).days
+        expiry_str = expiry.strftime("%d.%m.%Y %H:%M:%S")
+        log_msg = f"{domain}: истекает {expiry_str} (UTC), осталось {days_left} дней"
         print(log_msg)
         logging.info(log_msg)
 
-        # Отправка уведомления
-        if test_mode or days_left <= 5:
-            send_telegram_message(
-                f"⚠️ {'Тестовое уведомление: ' if test_mode else ''}"
-                f"Сертификат для {domain} истекает через {days_left} дней (до {expiry_str})."
-            )
+        already_notified = state.get(domain, False)
+
+
+        should_send = test_mode or (days_left <= EXPIRY_THRESHOLD_DAYS and not already_notified)
+
+        if should_send:
+
+            mode_text = "Тестовое уведомление: " if test_mode else ""
+            text = f"⚠️ {mode_text}Сертификат для {domain} истекает через {days_left} дней (до {expiry_str} UTC)."
+            if bot_ok:
+                ok = send_telegram_message(text)
+                if ok:
+                    logging.info(f"Уведомление отправлено для {domain}")
+                    # Если это не тест , то помечаем как отправленное
+                    if not test_mode and days_left <= EXPIRY_THRESHOLD_DAYS:
+                        state[domain] = True
+                else:
+                    logging.error(f"Не удалось отправить уведомление для {domain}")
+            else:
+                logging.error("Телеграм токен невалиден — сообщение не отправлено.")
+        else:
+            # Если срок > threshold, сбрасываем флаг чтобы уведомление могло придти позже
+            if days_left > EXPIRY_THRESHOLD_DAYS and state.get(domain, False):
+                state[domain] = False
+                logging.info(f"Сброшен флаг уведомления для {domain} (days_left={days_left})")
+
+    save_state(state)
 
 if __name__ == "__main__":
-    # test_mode=True для проверки уведомлений, False для реальной работы
-    check_domains()
+    # False для реальной работы.
+    check_domains(test_mode=True)
