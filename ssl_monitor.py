@@ -6,6 +6,7 @@ import json
 import logging
 from dotenv import load_dotenv
 from datetime import datetime, timezone
+import time
 
 STATE_FILE = "ssl_state.json"
 LOG_FILE = "ssl_monitor.log"
@@ -62,38 +63,44 @@ def validate_bot():
         return False
 
 # Получаем дату истечения сертификата
-def get_certificate_expiry(domain):
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((domain, 443), timeout=15) as sock:
-            with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert = ssock.getpeercert()
-                expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-                return expiry.replace(tzinfo=timezone.utc)
-    except Exception as e:
-        logging.error(f"Ошибка при получении сертификата {domain}: {e}")
-        return None
+def get_certificate_expiry(domain, retries=3, delay=2):
+    for attempt in range(1, retries + 1):
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((domain, 443), timeout=15) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                    cert = ssock.getpeercert()
+                    expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                    return expiry.replace(tzinfo=timezone.utc)
+        except Exception as e:
+            logging.error(f"Попытка {attempt} для {domain} не удалась: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                logging.error(f"Не удалось получить сертификат для {domain} после {retries} попыток")
+                return None
 
 # отправка Telegram-сообщения (с проверкой)
-def send_telegram_message(text):
+def send_telegram_message(text, retries=3, delay=2):
     if not BOT_TOKEN or not CHAT_ID:
         logging.error("BOT_TOKEN или CHAT_ID не заданы. Пропускаем отправку.")
         return False
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text}
-        r = requests.post(url, data=payload, timeout=8)
-        if not r.ok:
-            logging.error(f"Ошибка при отправке в Telegram: {r.status_code} {r.text}")
-            return False
-        resp = r.json()
-        if not resp.get("ok"):
-            logging.error(f"Telegram API вернул ok=false: {resp}")
-            return False
-        return True
-    except Exception as e:
-        logging.error(f"Исключение при отправке в Telegram: {e}")
-        return False
+    for attempt in range(1, retries + 1):
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            payload = {"chat_id": CHAT_ID, "text": text}
+            r = requests.post(url, data=payload, timeout=10)
+            if r.ok and r.json().get("ok"):
+                return True
+            else:
+                logging.error(f"Попытка {attempt}: Telegram вернул ошибку: {r.status_code} {r.text}")
+        except Exception as e:
+            logging.error(f"Попытка {attempt}: исключение при отправке в Telegram: {e}")
+        if attempt < retries:
+            time.sleep(delay)
+    logging.error("Не удалось отправить сообщение в Telegram после нескольких попыток")
+    return False
+
 
 # проверка доменов
 def check_domains(test_mode=False):
