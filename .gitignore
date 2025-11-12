@@ -1,2 +1,8 @@
 .env
 venv/
+ssl_monitor.log
+ssl_state.json
+config.yaml
+.idea/
+*.log
+*.json
